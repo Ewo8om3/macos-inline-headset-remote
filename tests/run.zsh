@@ -41,6 +41,73 @@ test_list_presets() {
   assert_output_contains "wispr-flow"
 }
 
+test_version_reports_1_0_1() {
+  run_cli version
+  assert_success || return
+  assert_eq "1.0.1" "$RUN_OUTPUT" "CLI version was not bumped"
+}
+
+test_detect_uses_selected_preset_device_in_either_option_order() {
+  run_cli detect --json
+  assert_success || return
+  jq -e '.preset_id == "wispr-flow" and .target_count == 1' <<<"$RUN_OUTPUT" >/dev/null \
+    || fail_assertion "detect did not default to the wispr-flow preset" || return
+
+  local copy="$SANDBOX/detect-presets"
+  local preset_dir="$copy/presets/alternate-device"
+  mkdir -p "$preset_dir" "$copy/devices"
+
+  jq '
+    .id = "alternate-device"
+    | .name = "Alternate device"
+    | .device_file = "alternate-device.json"
+    | .rule_description = "[inline-headset-remote:alternate-device:v1] fixture"
+  ' "$REPO_ROOT/presets/wispr-flow/manifest.json" > "$preset_dir/manifest.json" || return
+  jq '
+    .title = "Alternate device fixture"
+    | .rules[0].description = "[inline-headset-remote:alternate-device:v1] fixture"
+    | .rules[0].manipulators |= map(
+        .conditions |= map(
+          if .type == "device_if"
+          then .identifiers = [{"vendor_id": 1234, "product_id": 5678, "is_consumer": true}]
+          else .
+          end
+        )
+      )
+  ' "$REPO_ROOT/presets/wispr-flow/karabiner.json" > "$preset_dir/karabiner.json" || return
+  jq '
+    .id = "alternate-device"
+    | .karabiner_identifiers = {"vendor_id": 1234, "product_id": 5678, "is_consumer": true}
+    | .detection = {"product": "Alternate Headset", "transport": "USB", "is_consumer": true}
+    | .generic_identifier_warning = false
+  ' "$REPO_ROOT/devices/apple-audio-headset.json" > "$copy/devices/alternate-device.json" || return
+  jq -n '[{
+    manufacturer: "Fixture",
+    product: "Alternate Headset",
+    transport: "USB",
+    device_identifiers: {vendor_id: 1234, product_id: 5678, is_consumer: true}
+  }]' > "$copy/alternate-devices.json" || return
+
+  export HEADSET_REMOTE_PRESETS_DIR="$copy/presets"
+  export HEADSET_REMOTE_DEVICES_DIR="$copy/devices"
+  export MOCK_DEVICES_JSON="$copy/alternate-devices.json"
+
+  run_cli detect --preset alternate-device --json
+  assert_success || return
+  jq -e '
+    .preset_id == "alternate-device"
+    and .target_count == 1
+    and .generic_match_count == 1
+    and .karabiner_identifiers.vendor_id == 1234
+    and .detection.product == "Alternate Headset"
+  ' <<<"$RUN_OUTPUT" >/dev/null || fail_assertion "detect did not use the selected preset device" || return
+
+  run_cli detect --json --preset alternate-device
+  assert_success || return
+  jq -e '.preset_id == "alternate-device" and .target_count == 1' <<<"$RUN_OUTPUT" >/dev/null \
+    || fail_assertion "detect did not accept --json before --preset"
+}
+
 test_all_bundled_presets_pass_runtime_dry_run() {
   local original preset_dir preset_id
   original="$(jq -S . "$HEADSET_REMOTE_CONFIG")"
@@ -90,9 +157,41 @@ test_dry_run_does_not_mutate() {
 
   run_cli install --preset wispr-flow --dry-run --allow-generic-match
   assert_success || return
+  [[ "$RUN_OUTPUT" != *"current_device="* ]] || fail_assertion "dry-run leaked an internal variable declaration" || return
   assert_file_unchanged "$before" "$HEADSET_REMOTE_CONFIG" || return
   assert_output_matches 'dry.?run|would (install|change)|preview' || return
   [[ -z "$(find "$HEADSET_REMOTE_STATE_DIR" -type f -print -quit)" ]] || fail_assertion "dry-run wrote state or backup files"
+}
+
+test_install_rejects_old_karabiner_before_mutation() {
+  export MOCK_KARABINER_VERSION=15.3.9
+  local before
+  before="$(jq -S . "$HEADSET_REMOTE_CONFIG")"
+
+  run_cli install --preset wispr-flow --allow-generic-match
+  assert_failure || return
+  assert_output_matches 'Karabiner.*15[.]3[.]9.*(old|require)|15[.]4[.]0.*(newer|required)' || return
+  assert_file_unchanged "$before" "$HEADSET_REMOTE_CONFIG" || return
+  [[ -z "$(find "$HEADSET_REMOTE_STATE_DIR" -type f -print -quit)" ]] \
+    || fail_assertion "version rejection wrote state or backup files"
+}
+
+test_install_hint_uses_shell_escaped_executable_path() {
+  local copy="$SANDBOX/checkout's \$safe; directory"
+  mkdir -p "$copy"
+  cp -R "$REPO_ROOT/bin" "$REPO_ROOT/devices" "$REPO_ROOT/presets" "$copy/" || return
+
+  run_cli_at "$copy/bin/headset-remote" install --preset wispr-flow --allow-generic-match
+  assert_success || return
+  local hint hint_output hint_status
+  hint="$(print -r -- "$RUN_OUTPUT" | sed -n 's/^INFO  Run: //p' | tail -1)"
+  [[ -n "$hint" ]] || fail_assertion "post-install doctor hint was missing" || return
+  zsh -n -c "$hint" || fail_assertion "post-install doctor hint was not valid shell syntax" || return
+  hint_output="$(zsh -c "$hint" 2>&1)"
+  hint_status=$?
+  (( hint_status == 0 )) || fail_assertion "post-install doctor hint failed when executed: $hint_output" || return
+  [[ "$hint_output" == *"Doctor result: 0 error(s)"* ]] \
+    || fail_assertion "post-install doctor hint did not execute the copied CLI"
 }
 
 test_single_generic_match_requires_acknowledgement() {
@@ -766,10 +865,14 @@ if [[ ! -x "$CLI" ]]; then
 fi
 
 run_test "list presets" test_list_presets
+run_test "version reports 1.0.1" test_version_reports_1_0_1
+run_test "detect uses selected preset in either option order" test_detect_uses_selected_preset_device_in_either_option_order
 run_test "all bundled presets pass runtime dry-run" test_all_bundled_presets_pass_runtime_dry_run
 run_test "install preserves unrelated config" test_install_preserves_unrelated_configuration
 run_test "install is idempotent" test_install_is_idempotent
 run_test "dry-run has no mutations" test_dry_run_does_not_mutate
+run_test "install rejects old Karabiner before mutation" test_install_rejects_old_karabiner_before_mutation
+run_test "install hint uses executable checkout path" test_install_hint_uses_shell_escaped_executable_path
 run_test "single generic 0/0 match requires acknowledgement" test_single_generic_match_requires_acknowledgement
 run_test "generic 0/0 match requires override" test_generic_match_refuses_then_override_installs
 run_test "disconnected install requires override" test_disconnected_refuses_then_override_installs

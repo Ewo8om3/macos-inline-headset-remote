@@ -4,7 +4,7 @@ set -u
 
 case "${1:-}" in
   --version)
-    print -r -- "Karabiner-Elements 99.0.0-fixture"
+    print -r -- "Karabiner-Elements ${MOCK_KARABINER_VERSION:-99.0.0}-fixture"
     ;;
   --list-connected-devices)
     [[ -n "${MOCK_DEVICES_JSON:-}" && -f "$MOCK_DEVICES_JSON" ]] || {

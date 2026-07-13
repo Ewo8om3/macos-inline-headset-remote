@@ -11,10 +11,17 @@ The CLI exits nonzero for invalid arguments, failed safety checks, invalid JSON,
 ## `detect`
 
 ```zsh
-bin/headset-remote detect
+bin/headset-remote detect [--preset ID]
 ```
 
-Lists connected input devices relevant to the bundled device definitions. Use it before installation and whenever an adapter or connection path changes.
+Lists connected input devices relevant to the selected preset's device definition. `--preset ID` selects a preset; when omitted, detection defaults to `wispr-flow`. Use it before installation and whenever an adapter or connection path changes.
+
+Examples:
+
+```zsh
+bin/headset-remote detect
+bin/headset-remote detect --preset f18-dictation
+```
 
 Pay particular attention to generic devices with vendor ID `0` and product ID `0`. Those identifiers can describe more than one physical device.
 
