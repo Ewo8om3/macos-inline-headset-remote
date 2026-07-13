@@ -33,6 +33,22 @@ Included presets:
 
 Wispr Flow is required only for the included `wispr-flow` preset.
 
+## Tested environment
+
+The v1.0.1 workflow was verified with this exact setup:
+
+| Component | Tested value |
+| --- | --- |
+| Mac | Mac Studio (`Mac16,9`) with Apple M4 Max |
+| macOS | 26.5.2 (build `25F84`) |
+| Karabiner-Elements | 16.1.0 |
+| Wispr Flow | 1.6.7 |
+| Headset | Bose three-button wired headset; the exact model is not exposed to macOS |
+| Connection | Mac Studio built-in 3.5 mm headphone jack; no adapter |
+| Detected input | Apple `Headset` over `Audio`, exposed as a generic vendor/product `0/0` consumer device |
+
+Other Apple-compatible inline remotes may work, but this table is evidence for the tested path rather than a general compatibility claim. See [Device compatibility](docs/device-compatibility.md) before relying on a different headset or connection.
+
 Install `jq` with Homebrew if needed:
 
 ```zsh
@@ -46,13 +62,14 @@ Open Karabiner-Elements once and complete its macOS permission setup before usin
 Clone the repository, then run the CLI from the checkout:
 
 ```zsh
-git clone https://github.com/Ewo8om3/macos-inline-headset-remote.git
+git clone --branch v1.0.1 --depth 1 \
+  https://github.com/Ewo8om3/macos-inline-headset-remote.git
 cd macos-inline-headset-remote
 bin/headset-remote detect
 bin/headset-remote list-presets
 ```
 
-Read the detection output carefully. If it reports a generic `0/0` device and the listed product, manufacturer, transport, and consumer-device type match your headset, preview the installation:
+`detect` defaults to the `wispr-flow` preset; use `detect --preset ID` when evaluating another preset. Read the detection output carefully. If it reports a generic `0/0` device and the listed product, manufacturer, transport, and consumer-device type match your headset, preview the installation:
 
 ```zsh
 bin/headset-remote install --preset wispr-flow --dry-run --allow-generic-match

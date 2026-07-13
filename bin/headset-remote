@@ -4,7 +4,8 @@ set -euo pipefail
 umask 077
 
 readonly PROGRAM="headset-remote"
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
+readonly INVOCATION_PATH="${0:A}"
 readonly ROOT_DIR="${0:A:h:h}"
 readonly PRESETS_DIR="${HEADSET_REMOTE_PRESETS_DIR:-$ROOT_DIR/presets}"
 readonly DEVICES_DIR="${HEADSET_REMOTE_DEVICES_DIR:-$ROOT_DIR/devices}"
@@ -28,7 +29,7 @@ typeset RULE_DESCRIPTION MINIMUM_KARABINER_VERSION REQUIRED_PROCESS
 typeset DEVICE_IDENTIFIERS DEVICE_DETECTION GENERIC_IDENTIFIER_WARNING
 typeset DEVICES_JSON TARGET_DEVICE_COUNT GENERIC_MATCH_COUNT
 
-info() { print -- "INFO  $*"; }
+info() { print -r -- "INFO  $*"; }
 pass() { print -- "PASS  $*"; }
 warn() { print -u2 -- "WARN  $*"; }
 die() { print -u2 -- "ERROR $*"; exit 1; }
@@ -53,7 +54,7 @@ usage() {
 macOS Inline Headset Remote
 
 Usage:
-  headset-remote detect [--json]
+  headset-remote detect [--preset ID] [--json]
   headset-remote list-presets [--json]
   headset-remote install [--preset ID] [--profile NAME] [--dry-run]
                           --allow-generic-match [--allow-disconnected]
@@ -489,6 +490,17 @@ require_karabiner() {
   [[ -x "$KARABINER_CLI" ]] || die "Karabiner CLI is not executable: $KARABINER_CLI"
 }
 
+require_minimum_karabiner_version() {
+  local version_output installed_version
+  version_output="$("$KARABINER_CLI" --version 2>/dev/null)" \
+    || die "Unable to determine the installed Karabiner-Elements version."
+  installed_version="$(print -r -- "$version_output" | grep -Eo '[0-9]+([.][0-9]+)+' | head -1 || true)"
+  [[ -n "$installed_version" ]] \
+    || die "Unable to determine the installed Karabiner-Elements version."
+  version_ge "$installed_version" "$MINIMUM_KARABINER_VERSION" \
+    || die "Karabiner-Elements $installed_version is too old for preset '$PRESET_ID'; version $MINIMUM_KARABINER_VERSION or newer is required."
+}
+
 lint_rule() {
   if ! "$KARABINER_CLI" --lint-complex-modifications "$RULE_FILE" >/dev/null 2>&1; then
     die "Karabiner rejected the preset rule: $RULE_FILE"
@@ -790,14 +802,18 @@ cmd_list_presets() {
 
 cmd_detect() {
   require_jq
+  local preset="wispr-flow" json=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --preset) (( $# >= 2 )) || die "--preset requires an ID"; preset="$2"; shift 2 ;;
+      --json) json=1; shift ;;
+      -h|--help) usage; return ;;
+      *) die "Unknown detect option: $1" ;;
+    esac
+  done
+  load_preset "$preset"
   require_karabiner
-  load_preset "wispr-flow"
   load_devices
-  local json=0
-  if (( $# > 0 )); then
-    [[ "$1" == "--json" && $# == 1 ]] || die "Unknown detect option: $*"
-    json=1
-  fi
 
   if (( json )); then
     jq -n \
@@ -806,7 +822,8 @@ cmd_detect() {
       --argjson generic_match_count "$GENERIC_MATCH_COUNT" \
       --argjson identifiers "$DEVICE_IDENTIFIERS" \
       --argjson detection "$DEVICE_DETECTION" \
-      '{devices: $devices, target_count: $target_count, generic_match_count: $generic_match_count, karabiner_identifiers: $identifiers, detection: $detection}'
+      --arg preset_id "$PRESET_ID" \
+      '{preset_id: $preset_id, devices: $devices, target_count: $target_count, generic_match_count: $generic_match_count, karabiner_identifiers: $identifiers, detection: $detection}'
     return
   fi
 
@@ -815,10 +832,12 @@ cmd_detect() {
     .[] | select(.device_identifiers.is_consumer == true)
     | "- \(.manufacturer // "unknown") \(.product // "unknown") [transport=\(.transport // "unknown"), vendor=\(.device_identifiers.vendor_id // 0), product=\(.device_identifiers.product_id // 0)]"
   ' <<<"$DEVICES_JSON"
-  print -- "\nExpected Apple Audio Headset devices: $TARGET_DEVICE_COUNT"
-  print -- "Devices sharing Karabiner 0/0 consumer identifiers: $GENERIC_MATCH_COUNT"
+  print -- "\nExpected devices for preset '$PRESET_ID': $TARGET_DEVICE_COUNT"
+  print -- "Devices sharing the preset's Karabiner identifiers: $GENERIC_MATCH_COUNT"
   print -- "Karabiner condition: $DEVICE_IDENTIFIERS"
-  warn "The condition uses shared identifiers. Installation requires --allow-generic-match."
+  if [[ "$GENERIC_IDENTIFIER_WARNING" == "true" ]]; then
+    warn "The condition uses shared identifiers. Installation requires --allow-generic-match."
+  fi
 }
 
 cmd_install() {
@@ -842,6 +861,7 @@ cmd_install() {
   [[ -n "$preset" ]] || die "install requires --preset ID. Run '$PROGRAM list-presets' to see available presets."
   load_preset "$preset"
   require_karabiner
+  require_minimum_karabiner_version
   lint_rule
   validate_config_file
   load_devices
@@ -853,7 +873,7 @@ cmd_install() {
   recover_pending_operation
 
   local initial_hash profile config_mode rule owned original_rule original_rule_index
-  local device_entries original_device original_device_index last_device legacy_count
+  local device_entries original_device original_device_index last_device legacy_count current_device
   local candidate backup_path="" after_hash migrated_legacy='[]' journal_written=0
   initial_hash="$(sha256_file "$CONFIG_FILE")"
   profile="$(resolve_profile "$profile_request")"
@@ -876,7 +896,7 @@ cmd_install() {
     [[ "$(jq -r '.config_file' "$STATE_FILE")" == "$CONFIG_FILE" ]] || die "State belongs to a different Karabiner configuration."
     [[ "$(jq -r '.profile' "$STATE_FILE")" == "$profile" ]] || die "State belongs to another profile; uninstall it first."
 
-    local expected_rule expected_device current_rule current_device
+    local expected_rule expected_device current_rule
     expected_rule="$(jq -c '.last_applied_rule' "$STATE_FILE")"
     expected_device="$(jq -c '.last_applied_device' "$STATE_FILE")"
     current_rule="$(jq -c '.[0] // null' <<<"$owned")"
@@ -895,7 +915,6 @@ cmd_install() {
     original_device_index="$(matching_device_index "$profile")"
   fi
 
-  local current_device
   current_device="$(jq -c '.[0] // null' <<<"$device_entries")"
   last_device="$(jq -n --argjson current "$current_device" --argjson identifiers "$DEVICE_IDENTIFIERS" '
     if $current == null then
@@ -935,7 +954,7 @@ cmd_install() {
     "$rule" "$last_device" "$backup_path" "$initial_hash" "$after_hash" "$migrated_legacy"
   (( journal_written )) && clear_journal
   pass "Installed preset '$PRESET_ID' in Karabiner profile '$profile'."
-  info "Run: $PROGRAM doctor --preset $PRESET_ID --profile ${(q)profile}"
+  info "Run: ${(qq)INVOCATION_PATH} doctor --preset ${(qq)PRESET_ID} --profile ${(qq)profile}"
 }
 
 cmd_doctor() {

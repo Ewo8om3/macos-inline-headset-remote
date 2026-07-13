@@ -2,9 +2,11 @@
 
 Compatibility depends on the input events macOS exposes, not on the logo printed on the headphones.
 
-## Known working shape
+## Exact tested setup
 
-The flagship setup was tested with a Bose three-button wired inline remote. Through the tested analog audio connection, macOS and Karabiner report approximately:
+The v1.0.1 workflow was tested on macOS 26.5.2 (build `25F84`) using a Mac Studio (`Mac16,9`) with Apple M4 Max, Karabiner-Elements 16.1.0, and Wispr Flow 1.6.7.
+
+The input hardware was a Bose three-button wired headset connected directly to the Mac Studio's built-in 3.5 mm headphone jack, without an adapter. macOS does not expose the headset's exact model, so no narrower Bose model claim can be made. macOS and Karabiner report the input as an Apple generic `0/0` consumer device:
 
 ```text
 Product: Headset

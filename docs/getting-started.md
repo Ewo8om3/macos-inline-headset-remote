@@ -25,7 +25,7 @@ Download and install [Karabiner-Elements](https://karabiner-elements.pqrs.org/),
 Connect the headset directly or through the adapter you intend to use every day. Then run:
 
 ```zsh
-bin/headset-remote detect
+bin/headset-remote detect --preset wispr-flow
 ```
 
 The tool reports compatible consumer devices and the identifiers Karabiner sees. Compare:
@@ -36,7 +36,7 @@ The tool reports compatible consumer devices and the identifiers Karabiner sees.
 - whether the device exposes consumer controls;
 - whether more than one candidate matches.
 
-The tested Bose headset appears as an Apple `Headset` over `Audio`, with consumer events and vendor/product ID `0/0`.
+The tested Bose headset appears as an Apple `Headset` over `Audio`, with consumer events and vendor/product ID `0/0`. Detection defaults to `wispr-flow`, so `bin/headset-remote detect` is equivalent here; pass a different `--preset ID` when evaluating another preset.
 
 > [!CAUTION]
 > `0/0` means macOS did not expose useful vendor and product identifiers. It does not mean “Bose,” and it is not a unique hardware identity. Another generic consumer device may match the same condition. Disconnect unrelated headsets, dongles, and button devices while identifying yours.

@@ -21,6 +21,7 @@ setup_sandbox() {
   export HEADSET_REMOTE_APP_DIR="$SANDBOX/Applications"
   export MOCK_DEVICES_JSON="$FIXTURE_ROOT/devices/one-headset.json"
   export MOCK_GUIDANCE_JSON="$FIXTURE_ROOT/guidance/healthy.json"
+  export MOCK_KARABINER_VERSION=99.0.0
   export MOCK_WISPR_RUNNING=1
   export PATH="$FIXTURE_ROOT/bin:$PATH"
 
