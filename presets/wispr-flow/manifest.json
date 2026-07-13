@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "id": "wispr-flow",
+  "name": "Wispr Flow hands-free",
+  "summary": "Use the inline remote for app switching, hands-free dictation, and Enter/send.",
+  "device_file": "apple-audio-headset.json",
+  "rule_file": "karabiner.json",
+  "rule_description": "[inline-headset-remote:wispr-flow:v1] + apps, center Wispr Flow, - send",
+  "legacy_descriptions": [
+    "Bose wired remote: + apps, center Wispr Flow, - send"
+  ],
+  "minimum_karabiner_version": "15.4.0",
+  "required_process": "Wispr Flow",
+  "mappings": [
+    {
+      "button": "+",
+      "input": "volume_increment",
+      "action": "Command+Tab application switcher"
+    },
+    {
+      "button": "center",
+      "input": "play_or_pause",
+      "action": "Control+Option+Space hands-free toggle"
+    },
+    {
+      "button": "-",
+      "input": "volume_decrement",
+      "action": "Return/Enter"
+    }
+  ]
+}

@@ -1,0 +1,1219 @@
+#!/bin/zsh
+
+set -euo pipefail
+umask 077
+
+readonly PROGRAM="headset-remote"
+readonly VERSION="1.0.0"
+readonly ROOT_DIR="${0:A:h:h}"
+readonly PRESETS_DIR="${HEADSET_REMOTE_PRESETS_DIR:-$ROOT_DIR/presets}"
+readonly DEVICES_DIR="${HEADSET_REMOTE_DEVICES_DIR:-$ROOT_DIR/devices}"
+readonly CONFIG_FILE="${HEADSET_REMOTE_CONFIG:-$HOME/.config/karabiner/karabiner.json}"
+readonly STATE_DIR="${HEADSET_REMOTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/macos-inline-headset-remote}"
+readonly STATE_FILE="$STATE_DIR/installation.json"
+readonly BACKUP_DIR="$STATE_DIR/backups"
+readonly HISTORY_DIR="$STATE_DIR/history"
+readonly LOCK_DIR="$STATE_DIR/operation.lock"
+readonly LOCK_OWNER_FILE="$LOCK_DIR/owner.json"
+readonly JOURNAL_FILE="$STATE_DIR/pending-operation.json"
+readonly KARABINER_CLI="${HEADSET_REMOTE_KARABINER_CLI:-/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli}"
+readonly KARABINER_APP="${HEADSET_REMOTE_APP_DIR:-/Applications/Karabiner-Elements.app}"
+readonly OWNED_MARKER="[inline-headset-remote:"
+
+typeset -a TEMP_FILES
+typeset LOCK_HELD=0
+
+typeset PRESET_ID PRESET_DIR MANIFEST_FILE RULE_FILE DEVICE_FILE
+typeset RULE_DESCRIPTION MINIMUM_KARABINER_VERSION REQUIRED_PROCESS
+typeset DEVICE_IDENTIFIERS DEVICE_DETECTION GENERIC_IDENTIFIER_WARNING
+typeset DEVICES_JSON TARGET_DEVICE_COUNT GENERIC_MATCH_COUNT
+
+info() { print -- "INFO  $*"; }
+pass() { print -- "PASS  $*"; }
+warn() { print -u2 -- "WARN  $*"; }
+die() { print -u2 -- "ERROR $*"; exit 1; }
+
+cleanup() {
+  local file
+  for file in "${TEMP_FILES[@]:-}"; do
+    [[ -n "$file" && -e "$file" ]] && rm -f -- "$file"
+  done
+  if (( LOCK_HELD )); then
+    if [[ -f "$LOCK_OWNER_FILE" ]] && jq -e --argjson pid "$$" '.pid == $pid' "$LOCK_OWNER_FILE" >/dev/null 2>&1; then
+      rm -f -- "$LOCK_OWNER_FILE"
+    fi
+    rmdir -- "$LOCK_DIR" 2>/dev/null || true
+  fi
+}
+
+trap cleanup EXIT INT TERM
+
+usage() {
+  cat <<'EOF'
+macOS Inline Headset Remote
+
+Usage:
+  headset-remote detect [--json]
+  headset-remote list-presets [--json]
+  headset-remote install [--preset ID] [--profile NAME] [--dry-run]
+                          --allow-generic-match [--allow-disconnected]
+                          [--migrate-legacy]
+  headset-remote doctor [--preset ID] [--profile NAME]
+  headset-remote uninstall [--dry-run]
+  headset-remote backups
+  headset-remote restore (--latest | --backup PATH) [--dry-run] [--force]
+  headset-remote version
+
+The Apple audio headset service uses shared vendor/product identifiers (0/0).
+Installation therefore requires --allow-generic-match as an explicit safety
+acknowledgement. Run `headset-remote detect` before installing.
+
+Environment overrides for testing or advanced use:
+  HEADSET_REMOTE_CONFIG
+  HEADSET_REMOTE_STATE_DIR
+  HEADSET_REMOTE_KARABINER_CLI
+  HEADSET_REMOTE_APP_DIR
+  HEADSET_REMOTE_PRESETS_DIR
+  HEADSET_REMOTE_DEVICES_DIR
+EOF
+}
+
+require_not_root() {
+  (( EUID != 0 )) || die "Do not run this command as root or with sudo."
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required. Install it with: brew install jq"
+}
+
+sha256_file() {
+  /usr/bin/shasum -a 256 -- "$1" | awk '{print $1}'
+}
+
+json_equal() {
+  jq -n -e --argjson left "$1" --argjson right "$2" '$left == $right' >/dev/null
+}
+
+ensure_private_dir() {
+  local directory="$1"
+  [[ ! -L "$directory" ]] || die "Refusing to use a symlinked state directory: $directory"
+  mkdir -p -- "$directory"
+  chmod 700 "$directory"
+}
+
+acquire_lock() {
+  ensure_private_dir "$STATE_DIR"
+  if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
+    if [[ -f "$LOCK_OWNER_FILE" && ! -L "$LOCK_OWNER_FILE" ]] \
+      && jq -e '.pid | type == "number" and . > 0 and floor == .' "$LOCK_OWNER_FILE" >/dev/null 2>&1; then
+      local owner_pid
+      owner_pid="$(jq -r '.pid' "$LOCK_OWNER_FILE")"
+      if ! kill -0 "$owner_pid" 2>/dev/null; then
+        warn "Recovering stale operation lock left by process $owner_pid."
+        rm -f -- "$LOCK_OWNER_FILE"
+        rmdir -- "$LOCK_DIR" 2>/dev/null || die "Unable to remove stale operation lock: $LOCK_DIR"
+        mkdir -- "$LOCK_DIR" 2>/dev/null || die "Another operation acquired the lock while stale-lock recovery was running."
+      else
+        die "Another headset-remote operation is in progress (process $owner_pid)."
+      fi
+    else
+      die "Another headset-remote operation is in progress or left an unverified lock: $LOCK_DIR"
+    fi
+  fi
+  chmod 700 "$LOCK_DIR"
+  LOCK_HELD=1
+  jq -n --argjson pid "$$" --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg command "$PROGRAM" \
+    '{pid: $pid, started_at: $started_at, command: $command}' > "$LOCK_OWNER_FILE"
+  chmod 600 "$LOCK_OWNER_FILE"
+}
+
+validate_config_file() {
+  [[ -e "$CONFIG_FILE" ]] || die "Karabiner configuration not found: $CONFIG_FILE"
+  [[ -f "$CONFIG_FILE" ]] || die "Karabiner configuration is not a regular file: $CONFIG_FILE"
+  [[ ! -L "$CONFIG_FILE" ]] || die "Refusing to modify a symlinked Karabiner configuration: $CONFIG_FILE"
+
+  local owner
+  owner="$(stat -f '%u' "$CONFIG_FILE")"
+  [[ "$owner" == "$EUID" ]] || die "Karabiner configuration is not owned by the current user."
+  validate_karabiner_document "$CONFIG_FILE" \
+    || die "Karabiner configuration is not a valid configuration document."
+}
+
+validate_karabiner_document() {
+  local document="$1"
+  jq -e '
+    type == "object"
+    and (.profiles | type == "array" and length > 0)
+    and all(.profiles[];
+      (.name | type == "string" and length > 0)
+      and ((.selected // false) | type == "boolean")
+      and ((.complex_modifications.rules // []) | type == "array")
+      and all((.complex_modifications.rules // [])[];
+        type == "object"
+        and (.description | type == "string" and length > 0)
+        and (.manipulators | type == "array")
+        and all(.manipulators[];
+          type == "object"
+          and (.type | type == "string" and length > 0)
+          and (.from | type == "object")
+        )
+      )
+      and ((.devices // []) | type == "array")
+      and all((.devices // [])[];
+        type == "object"
+        and (.identifiers | type == "object")
+      )
+    )
+  ' "$document" >/dev/null 2>&1
+}
+
+validate_state_file() {
+  [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
+  [[ "$(stat -f '%u' "$STATE_FILE")" == "$EUID" ]] || return 1
+  jq -e '
+    def valid_rule:
+      type == "object"
+      and (.description | type == "string" and length > 0)
+      and (.manipulators | type == "array")
+      and all(.manipulators[];
+        type == "object"
+        and .type == "basic"
+        and ((keys - ["type", "from", "to", "conditions"]) | length == 0)
+        and (.from | type == "object")
+        and (.from.consumer_key_code | type == "string" and length > 0)
+        and (.to | type == "array" and length > 0)
+        and all(.to[];
+          type == "object"
+          and ((keys - ["key_code", "modifiers"]) | length == 0)
+          and (.key_code | type == "string" and length > 0)
+          and ((.modifiers // []) | type == "array" and all(.[]; type == "string"))
+        )
+        and (.conditions | type == "array")
+      );
+    def valid_device:
+      type == "object"
+      and (.identifiers | type == "object")
+      and ((.ignore // false) | type == "boolean");
+    .schema_version == 1
+    and (.preset_id | type == "string" and test("^[a-z0-9][a-z0-9-]*$"))
+    and (.profile | type == "string" and length > 0)
+    and (.config_file | type == "string" and length > 0)
+    and (.rule_description | type == "string" and startswith("[inline-headset-remote:"))
+    and (.original_rule == null or (.original_rule | valid_rule))
+    and (.original_rule_index == null or (.original_rule_index | type == "number" and . >= 0 and floor == .))
+    and (.original_device == null or (.original_device | valid_device))
+    and (.original_device_index == null or (.original_device_index | type == "number" and . >= 0 and floor == .))
+    and (.last_applied_rule | valid_rule)
+    and (.last_applied_device | valid_device)
+    and (.device_identifiers | type == "object" and (.is_consumer | type == "boolean"))
+    and (.backup_path | type == "string")
+    and (.config_hash_before | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.config_hash_after | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.migrated_legacy_descriptions | type == "array" and all(.[]; type == "string"))
+  ' "$STATE_FILE" >/dev/null 2>&1
+}
+
+state_matches_document() {
+  local document="$1"
+  validate_state_file || return 1
+  validate_karabiner_document "$document" || return 1
+  jq -e \
+    --arg marker "$OWNED_MARKER" \
+    --arg config_file "$CONFIG_FILE" \
+    --slurpfile state "$STATE_FILE" '
+      ($state[0]) as $s
+      | def matches_device($entry):
+          (($entry.identifiers.vendor_id // 0) == ($s.device_identifiers.vendor_id // 0))
+          and (($entry.identifiers.product_id // 0) == ($s.device_identifiers.product_id // 0))
+          and (($entry.identifiers.is_consumer // false) == ($s.device_identifiers.is_consumer // false));
+        [.profiles[] | select(.name == $s.profile)] as $profiles
+        | ($s.config_file == $config_file)
+        and (($profiles | length) == 1)
+        and ([($profiles[0].complex_modifications.rules // [])[]
+              | select((.description // "") | startswith($marker))]
+             == [$s.last_applied_rule])
+        and ([($profiles[0].devices // [])[] | select(matches_device(.))]
+             == [$s.last_applied_device])
+    ' "$document" >/dev/null 2>&1
+}
+
+write_journal() {
+  local operation="$1" backup_path="$2" before_hash="$3" after_hash="$4"
+  local temporary
+  ensure_private_dir "$STATE_DIR"
+  temporary="$(mktemp "$STATE_DIR/.pending-operation.json.XXXXXX")"
+  TEMP_FILES+=("$temporary")
+  jq -n \
+    --arg operation "$operation" \
+    --arg config_file "$CONFIG_FILE" \
+    --arg backup_path "$backup_path" \
+    --arg before_hash "$before_hash" \
+    --arg after_hash "$after_hash" \
+    --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+      {
+        schema_version: 1,
+        operation: $operation,
+        config_file: $config_file,
+        backup_path: $backup_path,
+        before_hash: $before_hash,
+        after_hash: $after_hash,
+        created_at: $created_at
+      }
+    ' > "$temporary"
+  chmod 600 "$temporary"
+  mv -f -- "$temporary" "$JOURNAL_FILE"
+}
+
+clear_journal() {
+  rm -f -- "$JOURNAL_FILE"
+}
+
+validate_journal() {
+  [[ -f "$JOURNAL_FILE" && ! -L "$JOURNAL_FILE" ]] || return 1
+  [[ "$(stat -f '%u' "$JOURNAL_FILE")" == "$EUID" ]] || return 1
+  jq -e '
+    .schema_version == 1
+    and (.operation == "install" or .operation == "uninstall" or .operation == "restore")
+    and (.config_file | type == "string" and length > 0)
+    and (.backup_path | type == "string" and length > 0)
+    and (.before_hash | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.after_hash | type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$JOURNAL_FILE" >/dev/null 2>&1
+}
+
+recover_pending_operation() {
+  [[ -e "$JOURNAL_FILE" ]] || return 0
+  validate_journal || die "Interrupted-operation journal is invalid or unsafe: $JOURNAL_FILE"
+
+  local operation journal_config backup_path before_hash after_hash current_hash
+  operation="$(jq -r '.operation' "$JOURNAL_FILE")"
+  journal_config="$(jq -r '.config_file' "$JOURNAL_FILE")"
+  backup_path="$(jq -r '.backup_path' "$JOURNAL_FILE")"
+  before_hash="$(jq -r '.before_hash' "$JOURNAL_FILE")"
+  after_hash="$(jq -r '.after_hash' "$JOURNAL_FILE")"
+  [[ "$journal_config" == "$CONFIG_FILE" ]] || die "Pending journal belongs to another configuration: $journal_config"
+  local canonical_backup canonical_backup_dir
+  [[ -d "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]] \
+    || die "Pending journal backup directory is missing or unsafe: $BACKUP_DIR"
+  [[ "$(stat -f '%u' "$BACKUP_DIR")" == "$EUID" ]] \
+    || die "Pending journal backup directory is not owned by the current user."
+  canonical_backup="${backup_path:A}"
+  canonical_backup_dir="${BACKUP_DIR:A}"
+  [[ "$backup_path" == "$BACKUP_DIR/"* \
+    && "$backup_path" != *"/../"* \
+    && "$backup_path" != *"/./"* \
+    && "${canonical_backup:h}" == "$canonical_backup_dir" ]] \
+    || die "Pending journal references a backup outside the managed backup directory."
+  [[ -f "$backup_path" && ! -L "$backup_path" ]] || die "Pending journal backup is missing or unsafe: $backup_path"
+  [[ "$(stat -f '%u' "$backup_path")" == "$EUID" ]] || die "Pending journal backup is not owned by the current user."
+  validate_karabiner_document "$backup_path" || die "Pending journal backup is not a valid Karabiner document."
+  [[ "$(sha256_file "$backup_path")" == "$before_hash" ]] \
+    || die "Pending journal backup does not match the recorded pre-operation configuration."
+  current_hash="$(sha256_file "$CONFIG_FILE")"
+
+  if [[ "$current_hash" == "$before_hash" ]]; then
+    warn "Clearing an interrupted '$operation' journal; the live configuration was not replaced."
+    clear_journal
+    return
+  fi
+
+  [[ "$current_hash" == "$after_hash" ]] \
+    || die "Live configuration differs from both sides of the pending '$operation' operation; manual recovery is required."
+
+  if [[ "$operation" == "install" ]] && validate_state_file \
+    && [[ "$(jq -r '.config_hash_after' "$STATE_FILE")" == "$after_hash" ]]; then
+    warn "Completing journal cleanup for an installation whose ownership state was committed."
+    clear_journal
+    return
+  fi
+
+  if [[ "$operation" == "uninstall" && ! -e "$STATE_FILE" ]]; then
+    warn "Completing journal cleanup for an uninstall whose ownership state was archived."
+    clear_journal
+    return
+  fi
+
+  if [[ "$operation" == "restore" ]]; then
+    warn "Completing interrupted full-restore bookkeeping."
+    archive_state
+    clear_journal
+    return
+  fi
+
+  warn "Rolling back interrupted '$operation' configuration replacement."
+  local candidate mode
+  mode="$(stat -f '%Lp' "$CONFIG_FILE")"
+  candidate="$(mktemp "${CONFIG_FILE:h}/.karabiner.json.XXXXXX")"
+  TEMP_FILES+=("$candidate")
+  cp -- "$backup_path" "$candidate"
+  atomic_replace_config "$candidate" "$after_hash"
+  TEMP_FILES=("${(@)TEMP_FILES:#$candidate}")
+  chmod "$mode" "$CONFIG_FILE"
+
+  if [[ "$operation" == "install" ]]; then
+    if ! state_matches_document "$CONFIG_FILE"; then
+      archive_state
+    fi
+  fi
+  clear_journal
+}
+
+resolve_profile() {
+  local requested="${1:-}"
+  local count
+
+  if [[ -n "$requested" ]]; then
+    count="$(jq --arg name "$requested" '[.profiles[] | select(.name == $name)] | length' "$CONFIG_FILE")"
+    [[ "$count" == "1" ]] || die "Profile '$requested' must exist exactly once (found $count)."
+    print -r -- "$requested"
+    return
+  fi
+
+  count="$(jq '[.profiles[] | select(.selected == true)] | length' "$CONFIG_FILE")"
+  [[ "$count" == "1" ]] || die "Karabiner must have exactly one selected profile (found $count)."
+  jq -r '.profiles[] | select(.selected == true) | .name' "$CONFIG_FILE"
+}
+
+version_ge() {
+  local installed="${1%%-*}"
+  local required="${2%%-*}"
+  local -a left right
+  local i l r
+  left=( ${(s:.:)installed} )
+  right=( ${(s:.:)required} )
+
+  for i in 1 2 3 4; do
+    l="${left[$i]:-0}"
+    r="${right[$i]:-0}"
+    (( l > r )) && return 0
+    (( l < r )) && return 1
+  done
+  return 0
+}
+
+load_preset() {
+  local id="${1:-wispr-flow}"
+  [[ "$id" =~ '^[a-z0-9][a-z0-9-]*$' ]] || die "Invalid preset ID: $id"
+
+  PRESET_ID="$id"
+  PRESET_DIR="$PRESETS_DIR/$id"
+  MANIFEST_FILE="$PRESET_DIR/manifest.json"
+  [[ -f "$MANIFEST_FILE" && ! -L "$MANIFEST_FILE" ]] || die "Preset not found: $id"
+  jq empty "$MANIFEST_FILE" >/dev/null || die "Preset manifest is invalid JSON: $MANIFEST_FILE"
+
+  jq -e --arg id "$id" '
+    .schema_version == 1
+    and .id == $id
+    and (.name | type == "string" and length > 0)
+    and (.summary | type == "string" and length > 0)
+    and (.device_file | type == "string" and test("^[A-Za-z0-9._-]+\\.json$"))
+    and (.rule_file | type == "string" and test("^[A-Za-z0-9._-]+\\.json$"))
+    and (.rule_description | type == "string" and startswith("[inline-headset-remote:" + $id + ":"))
+    and (.legacy_descriptions | type == "array" and all(.[]; type == "string" and length > 0))
+    and (.minimum_karabiner_version | type == "string" and test("^[0-9]+([.][0-9]+){1,3}$"))
+    and (.required_process | type == "string" and (length == 0 or test("^[A-Za-z0-9][A-Za-z0-9 ._()+-]*$")))
+    and (.mappings | type == "array" and length == 3)
+    and ([.mappings[].input] | unique | length == 3)
+  ' "$MANIFEST_FILE" >/dev/null || die "Preset manifest failed schema validation: $MANIFEST_FILE"
+
+  local device_name rule_name
+  device_name="$(jq -r '.device_file' "$MANIFEST_FILE")"
+  rule_name="$(jq -r '.rule_file' "$MANIFEST_FILE")"
+  DEVICE_FILE="$DEVICES_DIR/$device_name"
+  RULE_FILE="$PRESET_DIR/$rule_name"
+  [[ -f "$DEVICE_FILE" && ! -L "$DEVICE_FILE" ]] || die "Device definition not found: $DEVICE_FILE"
+  [[ -f "$RULE_FILE" && ! -L "$RULE_FILE" ]] || die "Karabiner rule not found: $RULE_FILE"
+  jq empty "$DEVICE_FILE" >/dev/null || die "Device definition is invalid JSON: $DEVICE_FILE"
+  jq empty "$RULE_FILE" >/dev/null || die "Karabiner rule is invalid JSON: $RULE_FILE"
+
+  jq -e '
+    .schema_version == 1
+    and (.id | type == "string" and test("^[a-z0-9][a-z0-9-]*$"))
+    and (.karabiner_identifiers.is_consumer == true)
+    and (.karabiner_identifiers.vendor_id | type == "number")
+    and (.karabiner_identifiers.product_id | type == "number")
+    and (.detection.product | type == "string")
+    and (.detection.transport | type == "string")
+    and (.detection.is_consumer == true)
+    and (.generic_identifier_warning | type == "boolean")
+    and (if (.karabiner_identifiers.vendor_id == 0 and .karabiner_identifiers.product_id == 0)
+         then .generic_identifier_warning == true
+         else true
+         end)
+  ' "$DEVICE_FILE" >/dev/null || die "Device definition failed schema validation: $DEVICE_FILE"
+
+  RULE_DESCRIPTION="$(jq -r '.rule_description' "$MANIFEST_FILE")"
+  MINIMUM_KARABINER_VERSION="$(jq -r '.minimum_karabiner_version' "$MANIFEST_FILE")"
+  REQUIRED_PROCESS="$(jq -r '.required_process' "$MANIFEST_FILE")"
+  DEVICE_IDENTIFIERS="$(jq -c '.karabiner_identifiers' "$DEVICE_FILE")"
+  DEVICE_DETECTION="$(jq -c '.detection' "$DEVICE_FILE")"
+  GENERIC_IDENTIFIER_WARNING="$(jq -r '.generic_identifier_warning' "$DEVICE_FILE")"
+  if jq -e '.vendor_id == 0 and .product_id == 0' <<<"$DEVICE_IDENTIFIERS" >/dev/null; then
+    GENERIC_IDENTIFIER_WARNING="true"
+  fi
+
+  jq -e --arg description "$RULE_DESCRIPTION" --argjson identifiers "$DEVICE_IDENTIFIERS" --slurpfile manifest "$MANIFEST_FILE" '
+    (.rules | type == "array" and length == 1)
+    and .rules[0].description == $description
+    and (.rules[0].manipulators | type == "array" and length == 3)
+    and all(.rules[0].manipulators[];
+      .type == "basic"
+      and ((keys - ["type", "from", "to", "conditions"]) | length == 0)
+      and (.from.consumer_key_code | type == "string")
+      and ((.from | keys) - ["consumer_key_code", "modifiers"] | length == 0)
+      and (.to | type == "array" and length > 0)
+      and all(.to[];
+        has("key_code")
+        and ((keys - ["key_code", "modifiers"]) | length == 0)
+      )
+      and any(.conditions[]?;
+        .type == "device_if"
+        and (.identifiers | length == 1)
+        and .identifiers[0] == $identifiers
+      )
+    )
+    and ([.rules[0].manipulators[].from.consumer_key_code] | unique | length == 3)
+    and (([.rules[0].manipulators[].from.consumer_key_code] | sort) == ([$manifest[0].mappings[].input] | sort))
+  ' "$RULE_FILE" >/dev/null || die "Karabiner rule failed safety validation: $RULE_FILE"
+
+  jq -e --arg marker "$OWNED_MARKER" '
+    all(.legacy_descriptions[]?;
+      startswith($marker)
+      or . == "Bose wired remote: + apps, center Wispr Flow, - send"
+    )
+  ' "$MANIFEST_FILE" >/dev/null || die "Preset declares an unsafe legacy rule description."
+}
+
+require_karabiner() {
+  [[ -d "$KARABINER_APP" ]] || die "Karabiner-Elements is not installed at: $KARABINER_APP"
+  [[ -x "$KARABINER_CLI" ]] || die "Karabiner CLI is not executable: $KARABINER_CLI"
+}
+
+lint_rule() {
+  if ! "$KARABINER_CLI" --lint-complex-modifications "$RULE_FILE" >/dev/null 2>&1; then
+    die "Karabiner rejected the preset rule: $RULE_FILE"
+  fi
+}
+
+load_devices() {
+  DEVICES_JSON="$("$KARABINER_CLI" --list-connected-devices 2>/dev/null)" \
+    || die "Unable to list connected Karabiner devices."
+  jq -e 'type == "array"' <<<"$DEVICES_JSON" >/dev/null || die "Karabiner returned invalid device JSON."
+
+  TARGET_DEVICE_COUNT="$(jq --argjson detection "$DEVICE_DETECTION" --argjson identifiers "$DEVICE_IDENTIFIERS" '
+    [
+      .[]
+      | select(
+          (.product // "") == $detection.product
+          and (.transport // "") == $detection.transport
+          and (.device_identifiers.is_consumer // false) == $detection.is_consumer
+          and (.device_identifiers.vendor_id // 0) == ($identifiers.vendor_id // 0)
+          and (.device_identifiers.product_id // 0) == ($identifiers.product_id // 0)
+        )
+    ] | length
+  ' <<<"$DEVICES_JSON")"
+
+  GENERIC_MATCH_COUNT="$(jq --argjson identifiers "$DEVICE_IDENTIFIERS" '
+    [
+      .[]
+      | select(
+          (.device_identifiers.vendor_id // 0) == ($identifiers.vendor_id // 0)
+          and (.device_identifiers.product_id // 0) == ($identifiers.product_id // 0)
+          and (.device_identifiers.is_consumer // false) == ($identifiers.is_consumer // false)
+        )
+    ] | length
+  ' <<<"$DEVICES_JSON")"
+}
+
+check_device_safety() {
+  local allow_generic="$1"
+  local allow_disconnected="$2"
+
+  if (( TARGET_DEVICE_COUNT == 0 )) && (( ! allow_disconnected )); then
+    die "No connected Apple Audio Headset consumer device was detected. Reconnect it or pass --allow-disconnected."
+  fi
+
+  if [[ "$GENERIC_IDENTIFIER_WARNING" == "true" ]] && (( ! allow_generic )); then
+    die "This device uses shared 0/0 consumer identifiers. Review 'headset-remote detect', then rerun with --allow-generic-match."
+  fi
+
+  if (( GENERIC_MATCH_COUNT > 1 )); then
+    warn "$GENERIC_MATCH_COUNT connected devices share the rule's generic identifiers. All may be affected."
+  fi
+}
+
+matching_device_entries() {
+  local profile="$1"
+  jq --arg profile "$profile" --argjson identifiers "$DEVICE_IDENTIFIERS" '
+    def matches($entry):
+      (($entry.identifiers.vendor_id // 0) == ($identifiers.vendor_id // 0))
+      and (($entry.identifiers.product_id // 0) == ($identifiers.product_id // 0))
+      and (($entry.identifiers.is_consumer // false) == ($identifiers.is_consumer // false));
+    [.profiles[] | select(.name == $profile) | (.devices // [])[] | select(matches(.))]
+  ' "$CONFIG_FILE"
+}
+
+matching_device_index() {
+  local profile="$1"
+  jq --arg profile "$profile" --argjson identifiers "$DEVICE_IDENTIFIERS" '
+    def matches($entry):
+      (($entry.identifiers.vendor_id // 0) == ($identifiers.vendor_id // 0))
+      and (($entry.identifiers.product_id // 0) == ($identifiers.product_id // 0))
+      and (($entry.identifiers.is_consumer // false) == ($identifiers.is_consumer // false));
+    .profiles[] | select(.name == $profile)
+    | (.devices // []) as $devices
+    | ([range(0; $devices | length) | select(. as $i | matches($devices[$i]))][0] // null)
+  ' "$CONFIG_FILE"
+}
+
+owned_rules() {
+  local profile="$1"
+  jq --arg profile "$profile" --arg marker "$OWNED_MARKER" '
+    [.profiles[] | select(.name == $profile) | (.complex_modifications.rules // [])[] | select((.description // "") | startswith($marker))]
+  ' "$CONFIG_FILE"
+}
+
+owned_rule_index() {
+  local profile="$1"
+  jq --arg profile "$profile" --arg marker "$OWNED_MARKER" '
+    .profiles[] | select(.name == $profile)
+    | (.complex_modifications.rules // []) as $rules
+    | ([range(0; $rules | length) | select(. as $i | (($rules[$i].description // "") | startswith($marker)))][0] // null)
+  ' "$CONFIG_FILE"
+}
+
+legacy_rule_count() {
+  local profile="$1"
+  local legacy
+  legacy="$(jq -c '.legacy_descriptions' "$MANIFEST_FILE")"
+  jq --arg profile "$profile" --argjson legacy "$legacy" '
+    [.profiles[] | select(.name == $profile) | (.complex_modifications.rules // [])[] | select(.description as $d | ($legacy | index($d)) != null)] | length
+  ' "$CONFIG_FILE"
+}
+
+make_candidate_install() {
+  local profile="$1"
+  local rule="$2"
+  local device_entry="$3"
+  local migrate_legacy="$4"
+  local destination="$5"
+  local legacy='[]'
+  (( migrate_legacy )) && legacy="$(jq -c '.legacy_descriptions' "$MANIFEST_FILE")"
+
+  jq --arg profile "$profile" \
+     --arg marker "$OWNED_MARKER" \
+     --argjson legacy "$legacy" \
+     --argjson rule "$rule" \
+     --argjson identifiers "$DEVICE_IDENTIFIERS" \
+     --argjson device_entry "$device_entry" '
+    def matches_device($entry):
+      (($entry.identifiers.vendor_id // 0) == ($identifiers.vendor_id // 0))
+      and (($entry.identifiers.product_id // 0) == ($identifiers.product_id // 0))
+      and (($entry.identifiers.is_consumer // false) == ($identifiers.is_consumer // false));
+    .profiles |= map(
+      if .name == $profile then
+        .complex_modifications = (.complex_modifications // {"rules": []})
+        | .complex_modifications.rules = (
+            [(.complex_modifications.rules // [])[] | select(.description as $d | ($legacy | index($d)) == null)]
+          )
+        | (.complex_modifications.rules as $rules
+          | [range(0; $rules | length) | select(. as $i | (($rules[$i].description // "") | startswith($marker)))]
+          ) as $owned_indexes
+        | if ($owned_indexes | length) == 0
+          then .complex_modifications.rules += [$rule]
+          else .complex_modifications.rules[$owned_indexes[0]] = $rule
+          end
+        | .devices = (.devices // [])
+        | (.devices as $devices
+          | [range(0; $devices | length) | select(. as $i | matches_device($devices[$i]))]
+          ) as $device_indexes
+        | if ($device_indexes | length) == 0
+          then .devices += [$device_entry]
+          else .devices[$device_indexes[0]] = $device_entry
+          end
+      else . end
+    )
+  ' "$CONFIG_FILE" > "$destination"
+}
+
+make_candidate_uninstall() {
+  local profile="$1"
+  local original_rule="$2"
+  local original_rule_index="$3"
+  local original_device="$4"
+  local original_device_index="$5"
+  local destination="$6"
+
+  jq --arg profile "$profile" \
+     --arg marker "$OWNED_MARKER" \
+     --argjson original_rule "$original_rule" \
+     --argjson original_rule_index "$original_rule_index" \
+     --argjson identifiers "$DEVICE_IDENTIFIERS" \
+     --argjson original_device "$original_device" \
+     --argjson original_device_index "$original_device_index" '
+    def matches_device($entry):
+      (($entry.identifiers.vendor_id // 0) == ($identifiers.vendor_id // 0))
+      and (($entry.identifiers.product_id // 0) == ($identifiers.product_id // 0))
+      and (($entry.identifiers.is_consumer // false) == ($identifiers.is_consumer // false));
+    def insert_at($array; $index; $value):
+      ($index // ($array | length)) as $requested
+      | ([0, $requested, ($array | length)] | sort | .[1]) as $safe
+      | $array[0:$safe] + [$value] + $array[$safe:];
+    .profiles |= map(
+      if .name == $profile then
+        .complex_modifications = (.complex_modifications // {"rules": []})
+        | .complex_modifications.rules = [
+            (.complex_modifications.rules // [])[]
+            | select(((.description // "") | startswith($marker)) | not)
+          ]
+        | if $original_rule != null
+          then .complex_modifications.rules = insert_at(.complex_modifications.rules; $original_rule_index; $original_rule)
+          else .
+          end
+        | .devices = [(.devices // [])[] | select(matches_device(.) | not)]
+        | if $original_device != null
+          then .devices = insert_at(.devices; $original_device_index; $original_device)
+          else .
+          end
+      else . end
+    )
+  ' "$CONFIG_FILE" > "$destination"
+}
+
+create_backup() {
+  local label="$1"
+  ensure_private_dir "$STATE_DIR"
+  ensure_private_dir "$BACKUP_DIR"
+  local id backup_file
+  id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$label"
+  backup_file="$BACKUP_DIR/$id.json"
+  cp -- "$CONFIG_FILE" "$backup_file"
+  chmod 600 "$backup_file"
+  print -r -- "$backup_file"
+}
+
+atomic_replace_config() {
+  local candidate="$1"
+  local initial_hash="$2"
+  local current_hash mode
+  current_hash="$(sha256_file "$CONFIG_FILE")"
+  [[ "$current_hash" == "$initial_hash" ]] \
+    || die "Karabiner configuration changed during this operation; nothing was written."
+  validate_karabiner_document "$candidate" || die "Generated configuration is not a valid Karabiner document."
+  mode="$(stat -f '%Lp' "$CONFIG_FILE")"
+  chmod "$mode" "$candidate"
+  mv -f -- "$candidate" "$CONFIG_FILE"
+}
+
+write_state() {
+  local profile="$1" original_rule="$2" original_rule_index="$3"
+  local original_device="$4" original_device_index="$5"
+  local last_rule="$6" last_device="$7" backup_path="$8"
+  local before_hash="$9" after_hash="${10}" migrated_legacy="${11}"
+  local temporary
+  ensure_private_dir "$STATE_DIR"
+  ensure_private_dir "$HISTORY_DIR"
+  temporary="$(mktemp "$STATE_DIR/.installation.json.XXXXXX")"
+  TEMP_FILES+=("$temporary")
+
+  jq -n \
+    --argjson schema_version 1 \
+    --arg installed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg preset_id "$PRESET_ID" \
+    --arg profile "$profile" \
+    --arg config_file "$CONFIG_FILE" \
+    --arg rule_description "$RULE_DESCRIPTION" \
+    --argjson original_rule "$original_rule" \
+    --argjson original_rule_index "$original_rule_index" \
+    --argjson original_device "$original_device" \
+    --argjson original_device_index "$original_device_index" \
+    --argjson last_applied_rule "$last_rule" \
+    --argjson last_applied_device "$last_device" \
+    --argjson device_identifiers "$DEVICE_IDENTIFIERS" \
+    --arg backup_path "$backup_path" \
+    --arg config_hash_before "$before_hash" \
+    --arg config_hash_after "$after_hash" \
+    --argjson migrated_legacy "$migrated_legacy" '
+      {
+        schema_version: $schema_version,
+        installed_at: $installed_at,
+        preset_id: $preset_id,
+        profile: $profile,
+        config_file: $config_file,
+        rule_description: $rule_description,
+        original_rule: $original_rule,
+        original_rule_index: $original_rule_index,
+        original_device: $original_device,
+        original_device_index: $original_device_index,
+        last_applied_rule: $last_applied_rule,
+        last_applied_device: $last_applied_device,
+        device_identifiers: $device_identifiers,
+        backup_path: $backup_path,
+        config_hash_before: $config_hash_before,
+        config_hash_after: $config_hash_after,
+        migrated_legacy_descriptions: $migrated_legacy
+      }
+    ' > "$temporary"
+  chmod 600 "$temporary"
+  mv -f -- "$temporary" "$STATE_FILE"
+}
+
+archive_state() {
+  [[ -f "$STATE_FILE" ]] || return 0
+  ensure_private_dir "$HISTORY_DIR"
+  mv -- "$STATE_FILE" "$HISTORY_DIR/installation-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+}
+
+cmd_list_presets() {
+  require_jq
+  local json=0
+  if (( $# > 0 )); then
+    [[ "$1" == "--json" && $# == 1 ]] || die "Unknown list-presets option: $*"
+    json=1
+  fi
+  local -a manifests
+  manifests=("$PRESETS_DIR"/*/manifest.json(N))
+  (( ${#manifests[@]} > 0 )) || die "No presets found in $PRESETS_DIR"
+
+  if (( json )); then
+    jq -s '[.[] | {id, name, summary, minimum_karabiner_version, mappings}]' "${manifests[@]}"
+  else
+    printf '%-24s %-30s %s\n' "ID" "NAME" "SUMMARY"
+    local manifest
+    for manifest in "${manifests[@]}"; do
+      jq -r '[.id, .name, .summary] | @tsv' "$manifest"
+    done | while IFS=$'\t' read -r id name summary; do
+      printf '%-24s %-30s %s\n' "$id" "$name" "$summary"
+    done
+  fi
+}
+
+cmd_detect() {
+  require_jq
+  require_karabiner
+  load_preset "wispr-flow"
+  load_devices
+  local json=0
+  if (( $# > 0 )); then
+    [[ "$1" == "--json" && $# == 1 ]] || die "Unknown detect option: $*"
+    json=1
+  fi
+
+  if (( json )); then
+    jq -n \
+      --argjson devices "$DEVICES_JSON" \
+      --argjson target_count "$TARGET_DEVICE_COUNT" \
+      --argjson generic_match_count "$GENERIC_MATCH_COUNT" \
+      --argjson identifiers "$DEVICE_IDENTIFIERS" \
+      --argjson detection "$DEVICE_DETECTION" \
+      '{devices: $devices, target_count: $target_count, generic_match_count: $generic_match_count, karabiner_identifiers: $identifiers, detection: $detection}'
+    return
+  fi
+
+  print -- "Connected consumer devices:"
+  jq -r '
+    .[] | select(.device_identifiers.is_consumer == true)
+    | "- \(.manufacturer // "unknown") \(.product // "unknown") [transport=\(.transport // "unknown"), vendor=\(.device_identifiers.vendor_id // 0), product=\(.device_identifiers.product_id // 0)]"
+  ' <<<"$DEVICES_JSON"
+  print -- "\nExpected Apple Audio Headset devices: $TARGET_DEVICE_COUNT"
+  print -- "Devices sharing Karabiner 0/0 consumer identifiers: $GENERIC_MATCH_COUNT"
+  print -- "Karabiner condition: $DEVICE_IDENTIFIERS"
+  warn "The condition uses shared identifiers. Installation requires --allow-generic-match."
+}
+
+cmd_install() {
+  require_not_root
+  require_jq
+  local preset="" profile_request="" dry_run=0 allow_generic=0 allow_disconnected=0 migrate_legacy=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --preset) (( $# >= 2 )) || die "--preset requires an ID"; preset="$2"; shift 2 ;;
+      --profile) (( $# >= 2 )) || die "--profile requires a name"; profile_request="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --allow-generic-match|--allow-generic-collision) allow_generic=1; shift ;;
+      --allow-disconnected) allow_disconnected=1; shift ;;
+      --migrate-legacy) migrate_legacy=1; shift ;;
+      -h|--help) usage; return ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+  done
+
+  [[ -n "$preset" ]] || die "install requires --preset ID. Run '$PROGRAM list-presets' to see available presets."
+  load_preset "$preset"
+  require_karabiner
+  lint_rule
+  validate_config_file
+  load_devices
+  check_device_safety "$allow_generic" "$allow_disconnected"
+  acquire_lock
+  if (( dry_run )) && [[ -e "$JOURNAL_FILE" ]]; then
+    die "A pending operation requires recovery; run a non-dry-run install or uninstall first."
+  fi
+  recover_pending_operation
+
+  local initial_hash profile config_mode rule owned original_rule original_rule_index
+  local device_entries original_device original_device_index last_device legacy_count
+  local candidate backup_path="" after_hash migrated_legacy='[]' journal_written=0
+  initial_hash="$(sha256_file "$CONFIG_FILE")"
+  profile="$(resolve_profile "$profile_request")"
+  config_mode="$(stat -f '%Lp' "$CONFIG_FILE")"
+  rule="$(jq -c '.rules[0]' "$RULE_FILE")"
+
+  owned="$(owned_rules "$profile")"
+  (( $(jq 'length' <<<"$owned") <= 1 )) || die "Multiple managed rules exist in profile '$profile'; refusing an ambiguous install."
+  device_entries="$(matching_device_entries "$profile")"
+  (( $(jq 'length' <<<"$device_entries") <= 1 )) || die "Multiple matching device entries exist in profile '$profile'."
+
+  legacy_count="$(legacy_rule_count "$profile")"
+  if (( legacy_count > 0 && ! migrate_legacy )); then
+    die "A legacy Bose/Wispr rule is present. Rerun with --migrate-legacy after reviewing the dry run."
+  fi
+  (( migrate_legacy )) && migrated_legacy="$(jq -c '.legacy_descriptions' "$MANIFEST_FILE")"
+
+  if [[ -f "$STATE_FILE" ]]; then
+    validate_state_file || die "Managed installation state is invalid or unsafe: $STATE_FILE"
+    [[ "$(jq -r '.config_file' "$STATE_FILE")" == "$CONFIG_FILE" ]] || die "State belongs to a different Karabiner configuration."
+    [[ "$(jq -r '.profile' "$STATE_FILE")" == "$profile" ]] || die "State belongs to another profile; uninstall it first."
+
+    local expected_rule expected_device current_rule current_device
+    expected_rule="$(jq -c '.last_applied_rule' "$STATE_FILE")"
+    expected_device="$(jq -c '.last_applied_device' "$STATE_FILE")"
+    current_rule="$(jq -c '.[0] // null' <<<"$owned")"
+    current_device="$(jq -c '.[0] // null' <<<"$device_entries")"
+    json_equal "$current_rule" "$expected_rule" || die "The managed rule was edited after installation; refusing to overwrite it."
+    json_equal "$current_device" "$expected_device" || die "The managed device entry was edited after installation; refusing to overwrite it."
+
+    original_rule="$(jq -c '.original_rule' "$STATE_FILE")"
+    original_rule_index="$(jq -c '.original_rule_index' "$STATE_FILE")"
+    original_device="$(jq -c '.original_device' "$STATE_FILE")"
+    original_device_index="$(jq -c '.original_device_index' "$STATE_FILE")"
+  else
+    original_rule="$(jq -c '.[0] // null' <<<"$owned")"
+    original_rule_index="$(owned_rule_index "$profile")"
+    original_device="$(jq -c '.[0] // null' <<<"$device_entries")"
+    original_device_index="$(matching_device_index "$profile")"
+  fi
+
+  local current_device
+  current_device="$(jq -c '.[0] // null' <<<"$device_entries")"
+  last_device="$(jq -n --argjson current "$current_device" --argjson identifiers "$DEVICE_IDENTIFIERS" '
+    if $current == null then
+      {identifiers: $identifiers, ignore: false}
+    else
+      $current | .identifiers = ((.identifiers // {}) + $identifiers) | .ignore = false
+    end
+  ')"
+
+  candidate="$(mktemp "${CONFIG_FILE:h}/.karabiner.json.XXXXXX")"
+  TEMP_FILES+=("$candidate")
+  make_candidate_install "$profile" "$rule" "$last_device" "$migrate_legacy" "$candidate"
+  validate_karabiner_document "$candidate" || die "Generated configuration is not a valid Karabiner document."
+
+  if (( dry_run )); then
+    print -- "Dry run for preset '$PRESET_ID' in profile '$profile':"
+    diff -u -- "$CONFIG_FILE" "$candidate" || true
+    print -- "\nNo files were changed."
+    return
+  fi
+
+  if cmp -s -- "$CONFIG_FILE" "$candidate"; then
+    info "Karabiner configuration already contains the requested rule."
+    [[ -f "$STATE_FILE" ]] && backup_path="$(jq -r '.backup_path // ""' "$STATE_FILE")"
+  else
+    backup_path="$(create_backup install)"
+    write_journal install "$backup_path" "$initial_hash" "$(sha256_file "$candidate")"
+    journal_written=1
+    atomic_replace_config "$candidate" "$initial_hash"
+    TEMP_FILES=(${TEMP_FILES:#$candidate})
+    chmod "$config_mode" "$CONFIG_FILE"
+    info "Backup created: $backup_path"
+  fi
+
+  after_hash="$(sha256_file "$CONFIG_FILE")"
+  write_state "$profile" "$original_rule" "$original_rule_index" "$original_device" "$original_device_index" \
+    "$rule" "$last_device" "$backup_path" "$initial_hash" "$after_hash" "$migrated_legacy"
+  (( journal_written )) && clear_journal
+  pass "Installed preset '$PRESET_ID' in Karabiner profile '$profile'."
+  info "Run: $PROGRAM doctor --preset $PRESET_ID --profile ${(q)profile}"
+}
+
+cmd_doctor() {
+  require_jq
+  local preset="wispr-flow" profile_request="" errors=0 warnings=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --preset) (( $# >= 2 )) || die "--preset requires an ID"; preset="$2"; shift 2 ;;
+      --profile) (( $# >= 2 )) || die "--profile requires a name"; profile_request="$2"; shift 2 ;;
+      *) die "Unknown doctor option: $1" ;;
+    esac
+  done
+  load_preset "$preset"
+
+  if [[ -d "$KARABINER_APP" ]]; then pass "Karabiner-Elements app is installed"; else warn "Karabiner-Elements app is missing"; errors=$((errors + 1)); fi
+  if [[ -x "$KARABINER_CLI" ]]; then
+    local version_output installed_version
+    version_output="$("$KARABINER_CLI" --version 2>/dev/null || print unknown)"
+    installed_version="$(print -r -- "$version_output" | grep -Eo '[0-9]+([.][0-9]+)+' | head -1 || true)"
+    [[ -n "$installed_version" ]] || installed_version="0.0.0"
+    if version_ge "$installed_version" "$MINIMUM_KARABINER_VERSION"; then
+      pass "Karabiner version $installed_version satisfies >= $MINIMUM_KARABINER_VERSION"
+    else
+      warn "Karabiner $installed_version is older than required $MINIMUM_KARABINER_VERSION"
+      errors=$((errors + 1))
+    fi
+
+    local guidance
+    guidance="$("$KARABINER_CLI" --show-settings-window-guidance 2>/dev/null || print '{}')"
+    if jq -e '.core_service_daemon_state.driver_activated == true' <<<"$guidance" >/dev/null 2>&1; then pass "Driver Extension is activated"; else warn "Driver Extension is not activated"; errors=$((errors + 1)); fi
+    if jq -e '.core_service_daemon_state.driver_connected == true' <<<"$guidance" >/dev/null 2>&1; then pass "Driver Extension is connected"; else warn "Driver Extension is not connected"; errors=$((errors + 1)); fi
+    if jq -e '.core_service_daemon_state.virtual_hid_keyboard_ready == true' <<<"$guidance" >/dev/null 2>&1; then pass "Virtual keyboard is ready"; else warn "Virtual keyboard is not ready"; errors=$((errors + 1)); fi
+    if [[ "$(jq -r '.core_service_daemon_state.karabiner_json_parse_error_message // ""' <<<"$guidance" 2>/dev/null)" == "" ]]; then pass "Karabiner reports no configuration parse errors"; else warn "Karabiner reports a configuration parse error"; errors=$((errors + 1)); fi
+
+    load_devices
+    if (( TARGET_DEVICE_COUNT == 1 )); then pass "Exactly one Apple Audio Headset target is connected"; else warn "Expected one Apple Audio Headset target; found $TARGET_DEVICE_COUNT"; warnings=$((warnings + 1)); fi
+    if (( GENERIC_MATCH_COUNT == 1 )); then pass "No current generic-identifier collision is visible"; else warn "$GENERIC_MATCH_COUNT connected devices share the 0/0 consumer identifiers"; warnings=$((warnings + 1)); fi
+  else
+    warn "Karabiner CLI is missing: $KARABINER_CLI"
+    errors=$((errors + 1))
+  fi
+
+  if [[ -f "$CONFIG_FILE" ]] && validate_karabiner_document "$CONFIG_FILE"; then
+    local profile current_rules current_rule expected_rule device_entries current_device
+    if [[ -n "$profile_request" ]]; then
+      profile="$(resolve_profile "$profile_request")"
+    elif validate_state_file \
+      && [[ "$(jq -r '.config_file' "$STATE_FILE")" == "$CONFIG_FILE" ]] \
+      && [[ "$(jq -r '.preset_id' "$STATE_FILE")" == "$PRESET_ID" ]]; then
+      profile="$(resolve_profile "$(jq -r '.profile' "$STATE_FILE")")"
+    else
+      profile="$(resolve_profile "")"
+    fi
+    current_rules="$(jq --arg profile "$profile" --arg description "$RULE_DESCRIPTION" '
+      [.profiles[] | select(.name == $profile) | (.complex_modifications.rules // [])[] | select(.description == $description)]
+    ' "$CONFIG_FILE")"
+    expected_rule="$(jq -c '.rules[0]' "$RULE_FILE")"
+    if [[ "$(jq 'length' <<<"$current_rules")" == "1" ]]; then
+      current_rule="$(jq -c '.[0]' <<<"$current_rules")"
+      if json_equal "$current_rule" "$expected_rule"; then
+        pass "Preset '$PRESET_ID' rule exactly matches the bundled definition"
+      else
+        warn "Preset '$PRESET_ID' has the expected description but different behavior"
+        errors=$((errors + 1))
+      fi
+    else
+      warn "Preset '$PRESET_ID' enabled rule count is $(jq 'length' <<<"$current_rules")"
+      errors=$((errors + 1))
+      current_rule='null'
+    fi
+
+    device_entries="$(matching_device_entries "$profile")"
+    if [[ "$(jq 'length' <<<"$device_entries")" == "1" ]]; then
+      current_device="$(jq -c '.[0]' <<<"$device_entries")"
+      if jq -e '(.ignore // false) == false' <<<"$current_device" >/dev/null; then
+        pass "Matching headset device entry is enabled"
+      else
+        warn "Matching headset device entry is ignored"
+        errors=$((errors + 1))
+      fi
+    else
+      warn "Expected exactly one matching headset device entry; found $(jq 'length' <<<"$device_entries")"
+      errors=$((errors + 1))
+      current_device='null'
+    fi
+
+    if [[ -f "$STATE_FILE" ]]; then
+      if validate_state_file; then
+        if [[ "$(jq -r '.preset_id' "$STATE_FILE")" == "$PRESET_ID" ]]; then
+          local state_rule state_device
+          state_rule="$(jq -c '.last_applied_rule' "$STATE_FILE")"
+          state_device="$(jq -c '.last_applied_device' "$STATE_FILE")"
+          if json_equal "$current_rule" "$state_rule" && json_equal "$current_device" "$state_device"; then
+            pass "Managed installation state matches the live rule and device entry"
+          else
+            warn "Managed installation state differs from the live configuration"
+            errors=$((errors + 1))
+          fi
+        else
+          warn "Managed state belongs to preset '$(jq -r '.preset_id' "$STATE_FILE")', not '$PRESET_ID'"
+          errors=$((errors + 1))
+        fi
+      else
+        warn "Managed installation state is invalid or unsafe"
+        errors=$((errors + 1))
+      fi
+    else
+      warn "No managed state is present; the rule may have been imported manually"
+      warnings=$((warnings + 1))
+    fi
+  else
+    warn "Karabiner configuration is missing or invalid: $CONFIG_FILE"
+    errors=$((errors + 1))
+  fi
+  if [[ -n "$REQUIRED_PROCESS" ]]; then
+    if pgrep -x "$REQUIRED_PROCESS" >/dev/null 2>&1; then pass "$REQUIRED_PROCESS is running"; else warn "$REQUIRED_PROCESS is not running"; warnings=$((warnings + 1)); fi
+  fi
+
+  print -- "\nDoctor result: $errors error(s), $warnings warning(s)."
+  (( errors == 0 ))
+}
+
+cmd_uninstall() {
+  require_not_root
+  require_jq
+  local dry_run=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      *) die "Unknown uninstall option: $1" ;;
+    esac
+  done
+
+  validate_config_file
+  acquire_lock
+  if (( dry_run )) && [[ -e "$JOURNAL_FILE" ]]; then
+    die "A pending operation requires recovery; run a non-dry-run install or uninstall first."
+  fi
+  recover_pending_operation
+
+  if [[ ! -f "$STATE_FILE" ]]; then
+    info "No managed installation is present; nothing to uninstall."
+    return
+  fi
+  validate_state_file || die "Managed installation state is invalid or unsafe: $STATE_FILE"
+  PRESET_ID="$(jq -r '.preset_id' "$STATE_FILE")"
+  RULE_DESCRIPTION="$(jq -r '.rule_description' "$STATE_FILE")"
+  DEVICE_IDENTIFIERS="$(jq -c '.device_identifiers' "$STATE_FILE")"
+
+  local initial_hash profile current_rules current_devices expected_rule expected_device
+  local current_rule current_device original_rule original_rule_index original_device original_device_index
+  local candidate backup_path config_mode
+  initial_hash="$(sha256_file "$CONFIG_FILE")"
+  profile="$(jq -r '.profile' "$STATE_FILE")"
+  [[ "$(resolve_profile "$profile")" == "$profile" ]] || die "Recorded profile is unavailable."
+  current_rules="$(owned_rules "$profile")"
+  current_devices="$(matching_device_entries "$profile")"
+  (( $(jq 'length' <<<"$current_rules") == 1 )) || die "Managed rule is missing or duplicated; refusing surgical uninstall."
+  (( $(jq 'length' <<<"$current_devices") == 1 )) || die "Managed device entry is missing or duplicated; refusing surgical uninstall."
+  current_rule="$(jq -c '.[0]' <<<"$current_rules")"
+  current_device="$(jq -c '.[0]' <<<"$current_devices")"
+  expected_rule="$(jq -c '.last_applied_rule' "$STATE_FILE")"
+  expected_device="$(jq -c '.last_applied_device' "$STATE_FILE")"
+  json_equal "$current_rule" "$expected_rule" || die "Managed rule changed after installation; it was preserved."
+  json_equal "$current_device" "$expected_device" || die "Managed device entry changed after installation; it was preserved."
+
+  original_rule="$(jq -c '.original_rule' "$STATE_FILE")"
+  original_rule_index="$(jq -c '.original_rule_index' "$STATE_FILE")"
+  original_device="$(jq -c '.original_device' "$STATE_FILE")"
+  original_device_index="$(jq -c '.original_device_index' "$STATE_FILE")"
+  candidate="$(mktemp "${CONFIG_FILE:h}/.karabiner.json.XXXXXX")"
+  TEMP_FILES+=("$candidate")
+  make_candidate_uninstall "$profile" "$original_rule" "$original_rule_index" "$original_device" "$original_device_index" "$candidate"
+  validate_karabiner_document "$candidate" || die "Generated uninstall result is not a valid Karabiner document."
+
+  if (( dry_run )); then
+    print -- "Dry run for managed uninstall:"
+    diff -u -- "$CONFIG_FILE" "$candidate" || true
+    print -- "\nNo files were changed."
+    return
+  fi
+
+  config_mode="$(stat -f '%Lp' "$CONFIG_FILE")"
+  backup_path="$(create_backup uninstall)"
+  write_journal uninstall "$backup_path" "$initial_hash" "$(sha256_file "$candidate")"
+  atomic_replace_config "$candidate" "$initial_hash"
+  TEMP_FILES=(${TEMP_FILES:#$candidate})
+  chmod "$config_mode" "$CONFIG_FILE"
+  archive_state
+  clear_journal
+  pass "Removed the managed headset-remote installation from profile '$profile'."
+  info "Backup created: $backup_path"
+}
+
+cmd_backups() {
+  (( $# == 0 )) || die "backups does not accept arguments."
+  local -a backups
+  backups=("$BACKUP_DIR"/*.json(Nom))
+  if (( ${#backups[@]} == 0 )); then
+    print -- "No backups found."
+    return
+  fi
+  local backup
+  for backup in "${backups[@]}"; do
+    print -r -- "$backup"
+  done
+}
+
+cmd_restore() {
+  require_not_root
+  require_jq
+  local selection="" dry_run=0 force=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --latest) selection="latest"; shift ;;
+      --backup) (( $# >= 2 )) || die "--backup requires a path"; selection="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --force) force=1; shift ;;
+      *) die "Unknown restore option: $1" ;;
+    esac
+  done
+  [[ -n "$selection" ]] || die "Choose --latest or --backup PATH."
+
+  local source
+  if [[ "$selection" == "latest" ]]; then
+    local -a backups
+    backups=("$BACKUP_DIR"/*.json(Nom))
+    (( ${#backups[@]} > 0 )) || die "No backups are available."
+    source="$backups[1]"
+  else
+    source="${selection:A}"
+  fi
+  [[ -f "$source" && ! -L "$source" ]] || die "Backup is not a regular JSON file: $source"
+  validate_karabiner_document "$source" || die "Backup is not a valid Karabiner configuration document: $source"
+  validate_config_file
+
+  if (( dry_run )); then
+    print -- "Dry run for full configuration restore from: $source"
+    diff -u -- "$CONFIG_FILE" "$source" || true
+    print -- "\nNo files were changed."
+    return
+  fi
+  (( force )) || die "Full restore replaces the complete Karabiner configuration. Rerun with --force after reviewing --dry-run."
+
+  acquire_lock
+  recover_pending_operation
+  local initial_hash candidate backup_path config_mode
+  initial_hash="$(sha256_file "$CONFIG_FILE")"
+  config_mode="$(stat -f '%Lp' "$CONFIG_FILE")"
+  candidate="$(mktemp "${CONFIG_FILE:h}/.karabiner.json.XXXXXX")"
+  TEMP_FILES+=("$candidate")
+  cp -- "$source" "$candidate"
+  backup_path="$(create_backup pre-restore)"
+  write_journal restore "$backup_path" "$initial_hash" "$(sha256_file "$candidate")"
+  atomic_replace_config "$candidate" "$initial_hash"
+  TEMP_FILES=(${TEMP_FILES:#$candidate})
+  chmod "$config_mode" "$CONFIG_FILE"
+  archive_state
+  clear_journal
+  pass "Restored complete Karabiner configuration from: $source"
+  info "Pre-restore backup created: $backup_path"
+}
+
+main() {
+  local command="${1:-help}"
+  (( $# > 0 )) && shift
+  case "$command" in
+    detect) cmd_detect "$@" ;;
+    list-presets) cmd_list_presets "$@" ;;
+    install) cmd_install "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    backups) cmd_backups "$@" ;;
+    restore) cmd_restore "$@" ;;
+    version|--version|-v) print -- "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; die "Unknown command: $command" ;;
+  esac
+}
+
+main "$@"

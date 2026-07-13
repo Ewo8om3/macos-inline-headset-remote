@@ -1,0 +1,41 @@
+#!/bin/zsh
+
+set -u
+
+case "${1:-}" in
+  --version)
+    print -r -- "Karabiner-Elements 99.0.0-fixture"
+    ;;
+  --list-connected-devices)
+    [[ -n "${MOCK_DEVICES_JSON:-}" && -f "$MOCK_DEVICES_JSON" ]] || {
+      print -u2 -- "mock karabiner_cli: MOCK_DEVICES_JSON is missing"
+      exit 70
+    }
+    command cat -- "$MOCK_DEVICES_JSON"
+    ;;
+  --show-settings-window-guidance)
+    [[ -n "${MOCK_GUIDANCE_JSON:-}" && -f "$MOCK_GUIDANCE_JSON" ]] || {
+      print -u2 -- "mock karabiner_cli: MOCK_GUIDANCE_JSON is missing"
+      exit 70
+    }
+    command cat -- "$MOCK_GUIDANCE_JSON"
+    ;;
+  --lint-complex-modifications)
+    [[ -n "${2:-}" && -f "$2" ]] || {
+      print -u2 -- "mock karabiner_cli: rule file is missing"
+      exit 66
+    }
+    jq -e '
+      (.title | type == "string" and length > 0)
+      and (.rules | type == "array" and length > 0)
+      and all(.rules[];
+        (.description | type == "string" and length > 0)
+        and (.manipulators | type == "array" and length > 0)
+      )
+    ' "$2" >/dev/null
+    ;;
+  *)
+    print -u2 -- "mock karabiner_cli: unsupported arguments: $*"
+    exit 64
+    ;;
+esac

@@ -1,0 +1,45 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS CLI and configuration
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Show tool versions
+        run: |
+          /bin/zsh --version
+          jq --version
+
+      - name: Check Zsh syntax
+        shell: /bin/zsh {0}
+        run: |
+          set -euo pipefail
+          files=(
+            bin/headset-remote
+            tests/*.zsh
+            tests/fixtures/bin/*
+          )
+          if [[ -d scripts ]]; then
+            files+=(scripts/*.sh(N) scripts/*.zsh(N))
+          fi
+          for file in $files; do
+            /bin/zsh -n "$file"
+          done
+
+      - name: Validate JSON and Karabiner rules
+        run: /bin/zsh tests/validate-rules.zsh
+
+      - name: Run fixture lifecycle tests
+        run: /bin/zsh tests/run.zsh

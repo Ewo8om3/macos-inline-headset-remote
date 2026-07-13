@@ -1,0 +1,8 @@
+{
+  "core_service_daemon_state": {
+    "driver_activated": false,
+    "driver_connected": false,
+    "virtual_hid_keyboard_ready": false,
+    "karabiner_json_parse_error_message": "fixture parse error"
+  }
+}

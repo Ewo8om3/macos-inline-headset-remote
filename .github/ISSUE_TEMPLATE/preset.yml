@@ -1,0 +1,33 @@
+name: Preset proposal
+description: Propose a safe mapping for another dictation or productivity application.
+title: "[Preset]: "
+labels: [preset]
+body:
+  - type: input
+    id: application
+    attributes:
+      label: Application and shortcut documentation
+      placeholder: Application name and official shortcut/settings URL
+    validations:
+      required: true
+  - type: textarea
+    id: mapping
+    attributes:
+      label: Proposed mapping
+      description: Describe +, center, and − actions and why each is reversible and low risk.
+    validations:
+      required: true
+  - type: textarea
+    id: testing
+    attributes:
+      label: Testing evidence
+      description: Include hardware, macOS, Karabiner version, and observed results.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: The preset contains no shell commands, credentials, secrets, or irreversible actions.
+          required: true

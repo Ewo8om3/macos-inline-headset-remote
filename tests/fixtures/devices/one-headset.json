@@ -1,0 +1,32 @@
+[
+  {
+    "device_id": 31,
+    "is_built_in_keyboard": false,
+    "is_built_in_pointing_device": false,
+    "location_id": 0,
+    "manufacturer": "Apple Inc.",
+    "product": "Headset",
+    "serial_number": "",
+    "transport": "Audio",
+    "device_identifiers": {
+      "is_consumer": true,
+      "is_keyboard": false,
+      "is_pointing_device": false,
+      "product_id": 0,
+      "vendor_id": 0
+    }
+  },
+  {
+    "device_id": 44,
+    "manufacturer": "Example",
+    "product": "Keyboard",
+    "transport": "USB",
+    "device_identifiers": {
+      "is_consumer": false,
+      "is_keyboard": true,
+      "is_pointing_device": false,
+      "product_id": 610,
+      "vendor_id": 1452
+    }
+  }
+]

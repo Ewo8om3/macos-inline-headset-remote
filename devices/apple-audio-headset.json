@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "apple-audio-headset",
+  "name": "Apple-compatible inline audio headset remote",
+  "description": "Three-button wired remotes exposed by macOS as an Audio Headset consumer device.",
+  "karabiner_identifiers": {
+    "vendor_id": 0,
+    "product_id": 0,
+    "is_consumer": true
+  },
+  "detection": {
+    "product": "Headset",
+    "transport": "Audio",
+    "is_consumer": true
+  },
+  "generic_identifier_warning": true,
+  "tested_hardware": [
+    {
+      "name": "Bose wired headphones with three-button inline remote",
+      "mac": "Mac Studio",
+      "status": "verified"
+    }
+  ]
+}

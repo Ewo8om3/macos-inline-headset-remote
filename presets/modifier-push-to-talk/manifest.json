@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "modifier-push-to-talk",
+  "name": "Control+Option push-to-talk",
+  "summary": "Hold the center button to hold Control+Option for push-to-talk applications.",
+  "device_file": "apple-audio-headset.json",
+  "rule_file": "karabiner.json",
+  "rule_description": "[inline-headset-remote:modifier-push-to-talk:v1] + apps, center push-to-talk, - send",
+  "legacy_descriptions": [],
+  "minimum_karabiner_version": "15.4.0",
+  "required_process": "",
+  "mappings": [
+    {
+      "button": "+",
+      "input": "volume_increment",
+      "action": "Command+Tab application switcher"
+    },
+    {
+      "button": "center",
+      "input": "play_or_pause",
+      "action": "Hold Control+Option"
+    },
+    {
+      "button": "-",
+      "input": "volume_decrement",
+      "action": "Return/Enter"
+    }
+  ]
+}

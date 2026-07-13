@@ -1,0 +1,62 @@
+{
+  "global": {
+    "check_for_updates_on_startup": false,
+    "show_in_menu_bar": true
+  },
+  "profiles": [
+    {
+      "name": "Primary",
+      "selected": true,
+      "complex_modifications": {
+        "parameters": {
+          "basic.to_if_alone_timeout_milliseconds": 777
+        },
+        "rules": [
+          {
+            "description": "Keep this unrelated rule",
+            "manipulators": [
+              {
+                "type": "basic",
+                "from": {
+                  "key_code": "caps_lock"
+                },
+                "to": [
+                  {
+                    "key_code": "escape"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "devices": [
+        {
+          "identifiers": {
+            "vendor_id": 1452,
+            "product_id": 610,
+            "is_keyboard": true
+          },
+          "ignore": false,
+          "disable_built_in_keyboard_if_exists": false
+        }
+      ],
+      "virtual_hid_keyboard": {
+        "keyboard_type_v2": "ansi"
+      }
+    },
+    {
+      "name": "Secondary",
+      "selected": false,
+      "complex_modifications": {
+        "rules": [
+          {
+            "description": "Leave the unselected profile alone",
+            "manipulators": []
+          }
+        ]
+      },
+      "devices": []
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+[
+  {
+    "device_id": 31,
+    "manufacturer": "Apple Inc.",
+    "product": "Headset",
+    "transport": "Audio",
+    "device_identifiers": {
+      "is_consumer": true,
+      "is_keyboard": false,
+      "is_pointing_device": false,
+      "product_id": 0,
+      "vendor_id": 0
+    }
+  },
+  {
+    "device_id": 32,
+    "manufacturer": "Generic",
+    "product": "Other Consumer Control",
+    "transport": "USB",
+    "device_identifiers": {
+      "is_consumer": true,
+      "is_keyboard": false,
+      "is_pointing_device": false,
+      "product_id": 0,
+      "vendor_id": 0
+    }
+  }
+]

@@ -1,0 +1,8 @@
+#!/bin/zsh
+
+if [[ "${*: -1}" == "Wispr Flow" && "${MOCK_WISPR_RUNNING:-1}" == 1 ]]; then
+  print -- "4242"
+  exit 0
+fi
+
+exit 1

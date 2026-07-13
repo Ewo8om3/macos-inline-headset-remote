@@ -1,0 +1,41 @@
+name: Device compatibility report
+description: Report a working or non-working three-button wired remote or adapter.
+title: "[Device]: "
+labels: [device-support]
+body:
+  - type: input
+    id: hardware
+    attributes:
+      label: Headset and adapter
+      placeholder: Manufacturer/model and exact adapter or audio interface
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: macOS version, Karabiner version, Mac model
+    validations:
+      required: true
+  - type: textarea
+    id: events
+    attributes:
+      label: Observed events
+      description: List the sanitized EventViewer result for +, center, and −.
+    validations:
+      required: true
+  - type: textarea
+    id: detection
+    attributes:
+      label: Sanitized device entry
+      description: Paste only the relevant entry from `bin/headset-remote detect --json`.
+      render: json
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed serial numbers, unrelated devices, personal configuration, and secrets.
+          required: true
